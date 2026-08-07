@@ -284,7 +284,11 @@ def build_path_steps(technology_graph, one_match):
         edge = technology_graph[this_uri][next_uri]
 
         # Which end of this edge is the parent? That tells us the direction.
-        if edge["parent_uri"] == next_uri:
+        # A skill_relation edge has no parent at all - it is a direct ESCO
+        # skill-to-skill link, not a step through the hierarchy.
+        if edge["relation_type"] == config.RELATION_TYPE_SKILL_RELATION:
+            direction = "related (ESCO skill-to-skill link)"
+        elif edge["parent_uri"] == next_uri:
             direction = "up to parent"
         else:
             direction = "down to child"
@@ -355,8 +359,17 @@ def describe_relationship(technology_graph, one_match):
       same concept          both typed words are names for ONE ESCO concept
       narrower term (child) the candidate skill sits directly under the JD skill
       broader term (parent) the candidate skill sits directly above it
-      sibling terms         both hang under the SAME parent
-      cousin terms          related only through a higher up shared concept
+      sibling terms         both hang under the SAME parent, and that parent
+                             is a real skill - not just a filing category
+      cousin terms          related only through a higher up shared concept,
+                             again through real skill relationships
+      same category only    the ONLY thing connecting them is a shared ESCO
+                             education category (a skill_group edge somewhere
+                             on the route) - not a real relationship, so this
+                             is a weak, expensive match even when the route
+                             LOOKS like a sibling or cousin shape
+      directly related      ESCO's own curated skill-to-skill link connects
+                             them, with no hierarchy climbing at all
       unrelated             no route between them at all
       not in ESCO           the JD skill is not in ESCO, so it was skipped
 
@@ -382,17 +395,42 @@ def describe_relationship(technology_graph, one_match):
     if len(path_of_uris) == 1:
         return "same concept", ""
 
-    # Walk the route and note whether each step climbs UP to a parent or
-    # goes DOWN to a child. Every edge remembers which end was the parent,
-    # so we do not have to guess.
+    # Walk the route and note whether each step climbs UP to a parent, goes
+    # DOWN to a child, or is a LATERAL step - one of ESCO's own curated
+    # skill-to-skill links, which has no parent at all. Every hierarchy edge
+    # remembers which end was the parent, so we do not have to guess.
+    #
+    # We also count how many steps were real hierarchy relationships versus
+    # skill_group steps - a step through a generic ESCO education category
+    # rather than a real skill relationship. A route can have exactly the
+    # shape of a sibling or cousin match (up once, down once) while only ever
+    # climbing through a filing category, which is a weak, expensive
+    # connection dressed up as a close one. But a longer route can ALSO mix
+    # real steps with a category step, and that is not the same thing as
+    # "no real relationship at all" - so we count both kinds separately
+    # instead of a single yes/no flag.
     steps_going_up = 0
     steps_going_down = 0
+    steps_lateral = 0
+    real_hierarchy_steps = 0
+    group_steps = 0
     highest_point_uri = path_of_uris[0]
 
     for position in range(len(path_of_uris) - 1):
         this_uri = path_of_uris[position]
         next_uri = path_of_uris[position + 1]
-        parent_uri = technology_graph[this_uri][next_uri]["parent_uri"]
+        edge = technology_graph[this_uri][next_uri]
+
+        if edge["relation_type"] == config.RELATION_TYPE_SKILL_RELATION:
+            steps_lateral = steps_lateral + 1
+            continue
+
+        if edge["relation_type"] == config.RELATION_TYPE_SKILL_GROUP:
+            group_steps = group_steps + 1
+        else:
+            real_hierarchy_steps = real_hierarchy_steps + 1
+
+        parent_uri = edge["parent_uri"]
 
         if parent_uri == next_uri:
             steps_going_up = steps_going_up + 1
@@ -401,20 +439,53 @@ def describe_relationship(technology_graph, one_match):
         else:
             steps_going_down = steps_going_down + 1
 
+    # No climbing or descending at all: the whole route is made of ESCO's own
+    # direct skill-to-skill links.
+    if steps_going_up == 0 and steps_going_down == 0:
+        if steps_lateral == 1:
+            return "directly related (ESCO skill link)", ""
+        return "related through a chain of ESCO skill links", ""
+
+    shared_concept_label = get_label(technology_graph, highest_point_uri)
+
+    # No group step at all: whatever shape the route has, it is made only of
+    # real hierarchy and/or lateral relationships, so the shape-based labels
+    # below can be trusted as genuine.
+    if group_steps == 0:
+        pass
+    # A group step exists, but so does at least one real hierarchy or
+    # lateral step: the route is genuinely part real, so say that plainly
+    # instead of writing off the whole match as filing-only.
+    elif real_hierarchy_steps > 0 or steps_lateral > 0:
+        return ("partly related - the route also needed a shared "
+                "education category, which makes it weaker and more "
+                "expensive than a fully real route", shared_concept_label)
+    # Every non-lateral step was a group step: nothing on the route is a
+    # real ESCO relationship.
+    else:
+        return ("same category only - not a real ESCO relationship",
+                shared_concept_label)
+
     # Never went down: the candidate skill is above the JD skill.
     if steps_going_down == 0:
+        if steps_lateral > 0:
+            return "broader, partly through a direct ESCO skill link", ""
         if steps_going_up == 1:
             return "broader term (parent)", ""
         return "broader, " + str(steps_going_up) + " levels up", ""
 
     # Never went up: the candidate skill is below the JD skill.
     if steps_going_up == 0:
+        if steps_lateral > 0:
+            return "narrower, partly through a direct ESCO skill link", ""
         if steps_going_down == 1:
             return "narrower term (child)", ""
         return "narrower, " + str(steps_going_down) + " levels down", ""
 
-    # Went up and then down, so the turning point is the shared concept.
-    shared_concept_label = get_label(technology_graph, highest_point_uri)
+    # Went up and then down, through real skill relationships only, so the
+    # turning point is a genuine shared concept.
+    if steps_lateral > 0:
+        return "related through a mix of hierarchy and a direct ESCO skill link", shared_concept_label
 
     if steps_going_up == 1 and steps_going_down == 1:
         return "sibling terms", shared_concept_label

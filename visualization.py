@@ -34,11 +34,14 @@ COLOUR_JOB_DESCRIPTION_SKILL = "#4CAF50"   # green
 COLOUR_CANDIDATE_SKILL = "#2196F3"         # blue
 COLOUR_INTERMEDIATE_NODE = "#FFC107"       # yellow
 
-# The two kinds of edge are drawn differently, because they mean very
-# different things. A real skill relationship is a solid dark line. An
-# education category is a faint dashed line, because it is a weak connection.
-COLOUR_SKILL_EDGE = "#2E7D32"        # dark green, solid
-COLOUR_SKILL_GROUP_EDGE = "#B0A9A0"  # faint grey, dashed
+# The three kinds of edge are drawn differently, because they mean very
+# different things. A real hierarchy skill relationship is a solid dark
+# green line. ESCO's own curated skill-to-skill link is a solid blue line -
+# just as cheap, but it did not come from the hierarchy at all. An education
+# category is a faint dashed line, because it is a weak connection.
+COLOUR_SKILL_EDGE = "#2E7D32"           # dark green, solid
+COLOUR_SKILL_GROUP_EDGE = "#B0A9A0"     # faint grey, dashed
+COLOUR_SKILL_RELATION_EDGE = "#1565C0"  # blue, solid
 
 
 def describe_edge_for_drawing(technology_graph, first_uri, second_uri):
@@ -58,12 +61,18 @@ def describe_edge_for_drawing(technology_graph, first_uri, second_uri):
     weight = edge["weight"]
 
     is_education_category = (relation_type == config.RELATION_TYPE_SKILL_GROUP)
+    is_skill_relation = (relation_type == config.RELATION_TYPE_SKILL_RELATION)
 
     # The short text drawn next to the line.
     if is_education_category:
         label = "group  " + str(weight)
+        colour = COLOUR_SKILL_GROUP_EDGE
+    elif is_skill_relation:
+        label = "related  " + str(weight)
+        colour = COLOUR_SKILL_RELATION_EDGE
     else:
         label = "skill  " + str(weight)
+        colour = COLOUR_SKILL_EDGE
 
     # The longer text shown when you hover over the line.
     title = ("relationship: " + relation_type
@@ -74,6 +83,11 @@ def describe_edge_for_drawing(technology_graph, first_uri, second_uri):
         title = title + "\n\nThis is only an ESCO education category, not a"
         title = title + "\nreal relationship between the two skills, so it"
         title = title + "\nis expensive to travel through."
+    elif is_skill_relation:
+        title = title + "\n\nThis comes from ESCO's own curated skill-to-skill"
+        title = title + "\ndata, not the hierarchy, so it is cheap to travel"
+        title = title + "\nthrough even though the two skills sit in"
+        title = title + "\ndifferent branches of the tree."
     else:
         title = title + "\n\nThis is a real ESCO skill relationship, so it"
         title = title + "\nis cheap to travel through."
@@ -81,7 +95,7 @@ def describe_edge_for_drawing(technology_graph, first_uri, second_uri):
     return {
         "label": label,
         "title": title,
-        "color": COLOUR_SKILL_GROUP_EDGE if is_education_category else COLOUR_SKILL_EDGE,
+        "color": colour,
         "dashes": is_education_category,
         "width": 1 if is_education_category else 3,
     }

@@ -76,6 +76,25 @@ def load_broader_relations_table():
                            "broaderLabel", "broaderType"]]
 
 
+def load_skill_skill_relations_table():
+    """
+    Read skillSkillRelations_en.csv into a pandas DataFrame.
+
+    Unlike broaderRelationsSkillPillar_en.csv, these rows are not parent and
+    child. Each row is ESCO's own curators saying two skills genuinely belong
+    together - one is "essential" or "optional" for the other - even when
+    they sit in completely different branches of the classification tree.
+
+    What it does : loads every curated skill-to-skill relation from disk.
+    Inputs       : nothing (the file path comes from config.py)
+    Outputs      : a DataFrame with the columns
+                   originalSkillUri, relationType, relatedSkillUri
+    """
+    relations_table = pd.read_csv(config.SKILL_SKILL_RELATIONS_FILE)
+
+    return relations_table[["originalSkillUri", "relationType", "relatedSkillUri"]]
+
+
 def load_digital_skill_uris():
     """
     Read digitalSkillsCollection_en.csv and return just the URIs.
@@ -343,6 +362,54 @@ def get_edge_weight(relation_type, parent_uri, depth_of_node):
         depth_of_parent, config.DEFAULT_SKILL_GROUP_EDGE_WEIGHT)
 
 
+def add_skill_relation_edges(technology_graph):
+    """
+    Add ESCO's own curated skill-to-skill links as extra, cheap edges.
+
+    broaderRelationsSkillPillar_en.csv only connects a skill to its parent, so
+    two skills only end up close together when they happen to share an
+    ancestor. skillSkillRelations_en.csv is different: each row is ESCO
+    directly saying "these two skills go together", regardless of where they
+    sit in the tree.
+
+    We only connect skills that are already part of the technology graph.
+    This does not change which skills count as "technology" - it only adds
+    new routes between the ones we already kept.
+
+    What it does : adds skill-to-skill edges on top of the hierarchy edges.
+    Inputs       : technology_graph - the graph, with hierarchy edges and
+                   weights already in place
+    Outputs      : nothing, it changes the graph in place
+    """
+    relations_table = load_skill_skill_relations_table()
+
+    for original_uri, relation_type, related_uri in zip(
+        relations_table["originalSkillUri"],
+        relations_table["relationType"],
+        relations_table["relatedSkillUri"],
+    ):
+        # Only connect skills we already kept.
+        if original_uri not in technology_graph or related_uri not in technology_graph:
+            continue
+
+        # The hierarchy may already connect these two directly. A hierarchy
+        # skill edge is already cheap, so there is nothing to add.
+        if technology_graph.has_edge(original_uri, related_uri):
+            continue
+
+        if relation_type == "essential":
+            weight = config.ESSENTIAL_SKILL_RELATION_WEIGHT
+        else:
+            weight = config.OPTIONAL_SKILL_RELATION_WEIGHT
+
+        technology_graph.add_edge(
+            original_uri, related_uri,
+            relation_type=config.RELATION_TYPE_SKILL_RELATION,
+            esco_broader_type=relation_type,
+            parent_uri=None,
+            weight=weight)
+
+
 # ---------------------------------------------------------------------------
 # Step 4: build the graph
 # ---------------------------------------------------------------------------
@@ -385,18 +452,38 @@ def build_technology_graph():
         relations_table["broaderLabel"],
         relations_table["broaderType"],
     ):
+        # A SkillGroup row is only a filing decision (which ISCED-F education
+        # category a skill sits under), not a statement that two skills are
+        # related. We only want real relationships in the graph, so these
+        # rows are skipped entirely - no node, no edge.
+        if esco_broader_type == config.ESCO_BROADER_TYPE_GROUP:
+            continue
+
         # An edge is only created when BOTH ends are in our technology subset.
         if child_uri in all_graph_uris and parent_uri in all_graph_uris:
             technology_graph.add_node(child_uri, label=child_label)
             technology_graph.add_node(parent_uri, label=parent_label)
 
-            # Remember WHICH KIND of relationship this is. The weight below
-            # depends on it, and so does the explanation shown to the user.
             technology_graph.add_edge(
                 child_uri, parent_uri,
                 relation_type=translate_relation_type(esco_broader_type),
                 esco_broader_type=esco_broader_type,
                 parent_uri=parent_uri)
+
+    # --- make sure every technology skill is recognised, even with no route
+    # -----------------------------------------------------------------
+    # A skill's only relation row in ESCO might have been a SkillGroup row -
+    # which we just skipped. Dropping that row must not un-recognise the
+    # skill itself: ESCO does have it, so typing its name should still find
+    # it, even if it cannot yet be compared to anything else. This also lets
+    # add_skill_relation_edges() below connect it, if a curated relation
+    # exists for it.
+    label_of_skill_uri = dict(zip(skills_table["conceptUri"],
+                                 skills_table["preferredLabel"]))
+
+    for skill_uri in technology_skill_uris:
+        if skill_uri not in technology_graph:
+            technology_graph.add_node(skill_uri, label=label_of_skill_uri[skill_uri])
 
     # --- now that the shape is known, measure depth and set the weights ---
     # This has to happen after the edges exist, because depth is worked out by
@@ -410,6 +497,11 @@ def build_technology_graph():
         edge = technology_graph[first_uri][second_uri]
         edge["weight"] = get_edge_weight(edge["relation_type"],
                                         edge["parent_uri"], depth_of_node)
+
+    # --- add ESCO's own curated skill-to-skill links ----------------------
+    # This happens after depth is measured, so these lateral edges never get
+    # mistaken for a hierarchy step when working out how generic a node is.
+    add_skill_relation_edges(technology_graph)
 
     # --- finally copy the labels and descriptions onto the nodes ----------
     add_skill_details_to_nodes(technology_graph, skills_table)
@@ -582,6 +674,13 @@ def print_graph_report(technology_graph):
         if one_weight in already_shown_weights:
             continue
         already_shown_weights.add(one_weight)
+
+        if edge_data["relation_type"] == config.RELATION_TYPE_SKILL_RELATION:
+            print("   weight " + str(one_weight) + "  "
+                  + get_label(technology_graph, first_uri)
+                  + "  <->  " + get_label(technology_graph, second_uri)
+                  + "  (" + edge_data["esco_broader_type"] + " ESCO skill link)")
+            continue
 
         parent_uri = edge_data["parent_uri"]
         child_uri = second_uri if parent_uri == first_uri else first_uri

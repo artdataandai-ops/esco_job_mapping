@@ -1,0 +1,14 @@
+# Python bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Local secrets - never commit real API keys
+.env
+
+# Logs
+*.log
+
+# Docs / reference material (not needed to run the app)
+*.pdf
+*.docx

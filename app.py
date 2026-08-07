@@ -17,14 +17,18 @@ Run the demo with:
     streamlit run app.py
 """
 
+import os
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
 from graph import build_technology_graph
 from mapping import build_mapping_index, map_skill_list_to_esco, shorten_uri
+from pdf_extraction import extract_text_from_pdf_bytes
 from scoring import (build_path_steps, build_path_text, count_skipped_skills,
                      describe_relationship, explain_route, score_candidate)
+from skill_extraction import extract_skills_from_text
 from visualization import build_explanation_graph_html
 
 # ---------------------------------------------------------------------------
@@ -91,22 +95,88 @@ if "candidates" not in st.session_state:
     st.session_state.candidates = []
 
 
+# ---------------------------------------------------------------------------
+# Shared helper: one uploaded PDF -> a list of skill names
+# ---------------------------------------------------------------------------
+#
+# Used by both Section 1 (the job description) and Section 2 (candidates).
+# Turns the PDF into text with pdf_extraction, then asks the LLM in
+# skill_extraction which words in that text are skills. Any failure (a bad
+# PDF, a missing OPENAI_API_KEY, the LLM call itself) is shown right there as
+# an error for that one file, instead of crashing the whole page.
+
+def extract_skills_from_uploaded_pdf(uploaded_file):
+    """
+    Turn one uploaded PDF into a list of skill names.
+
+    What it does : reads the PDF, extracts its text, then asks the LLM which
+                   words in that text are skills.
+    Inputs       : uploaded_file - a Streamlit UploadedFile from a PDF
+                   file_uploader widget
+    Outputs      : a list of skill name strings, or None if something failed
+                   (the failure is already shown on screen as an st.error)
+    """
+    try:
+        document_text = extract_text_from_pdf_bytes(uploaded_file.getvalue())
+    except Exception as error:
+        st.error("Could not read " + uploaded_file.name + ": " + str(error))
+        return None
+
+    if document_text == "":
+        st.warning(uploaded_file.name + " has no readable text (maybe a "
+                  "scanned image?). Nothing was extracted.")
+        return None
+
+    try:
+        return extract_skills_from_text(document_text)
+    except Exception as error:
+        st.error("Skill extraction failed for " + uploaded_file.name
+                + ": " + str(error))
+        return None
+
+
 # ===========================================================================
 # SECTION 1 - Enter Job Description Skills
 # ===========================================================================
 
 st.header("1. Enter Job Description Skills")
 
-with st.form("job_description_skill_form", clear_on_submit=True):
-    typed_job_skill = st.text_input("Job description skill",
-                                   placeholder="for example: Python")
-    job_skill_was_added = st.form_submit_button("Add skill")
+upload_jd_tab, type_jd_tab = st.tabs(["Upload PDF", "Type manually"])
 
-if job_skill_was_added and typed_job_skill.strip() != "":
-    st.session_state.job_description_skills.append(typed_job_skill.strip())
+with upload_jd_tab:
+    uploaded_jd_pdf = st.file_uploader("Job description (PDF)", type=["pdf"],
+                                      key="jd_pdf_uploader")
+
+    if uploaded_jd_pdf is not None and st.button("Extract skills from PDF"):
+        with st.spinner("Reading the PDF and asking the LLM for skills ..."):
+            extracted_job_skills = extract_skills_from_uploaded_pdf(uploaded_jd_pdf)
+
+        if extracted_job_skills is not None:
+            if len(extracted_job_skills) == 0:
+                st.warning("No technical skills were found in that PDF.")
+            else:
+                st.session_state.job_description_skills.extend(extracted_job_skills)
+                st.success("Added " + str(len(extracted_job_skills))
+                          + " skill(s) from " + uploaded_jd_pdf.name + ".")
+                st.rerun()
+
+with type_jd_tab:
+    with st.form("job_description_skill_form", clear_on_submit=True):
+        typed_job_skills = st.text_area(
+            "Job description skills (one skill per line)",
+            placeholder="Python\nPostgreSQL\nJenkins\nDocker",
+            height=140,
+        )
+        job_skills_were_added = st.form_submit_button("Add skills")
+
+    if job_skills_were_added:
+        # Turn the text area into a clean list of skills, one per line.
+        for one_line in typed_job_skills.split("\n"):
+            if one_line.strip() != "":
+                st.session_state.job_description_skills.append(one_line.strip())
 
 if len(st.session_state.job_description_skills) == 0:
-    st.info("No job description skills yet. Add them one by one.")
+    st.info("No job description skills yet. Upload a PDF or add them all at once.")
 else:
     st.write("**Job description skills**")
     for one_job_skill in st.session_state.job_description_skills:
@@ -123,27 +193,73 @@ else:
 
 st.header("2. Add Candidates")
 
-with st.form("candidate_form", clear_on_submit=True):
-    typed_candidate_name = st.text_input("Candidate name",
-                                       placeholder="for example: John")
-    typed_candidate_skills = st.text_area(
-        "Candidate skills (one skill per line)",
-        placeholder="Python\nFlask\nDocker\nAzure",
-        height=140,
-    )
-    candidate_was_added = st.form_submit_button("Add candidate")
+upload_resume_tab, type_candidate_tab = st.tabs(["Upload resumes (PDF)", "Type manually"])
 
-if candidate_was_added and typed_candidate_name.strip() != "":
-    # Turn the text area into a clean list of skills, one per line.
-    candidate_skill_list = []
-    for one_line in typed_candidate_skills.split("\n"):
-        if one_line.strip() != "":
-            candidate_skill_list.append(one_line.strip())
+with upload_resume_tab:
+    uploaded_resume_pdfs = st.file_uploader(
+        "Resume PDFs (one candidate per file)", type=["pdf"],
+        accept_multiple_files=True, key="resume_pdf_uploader")
 
-    st.session_state.candidates.append({
-        "name": typed_candidate_name.strip(),
-        "skills": candidate_skill_list,
-    })
+    if uploaded_resume_pdfs and st.button("Extract candidates from PDFs"):
+        existing_candidate_names = {one_candidate["name"]
+                                   for one_candidate in st.session_state.candidates}
+        added_candidate_names = []
+
+        for one_resume_pdf in uploaded_resume_pdfs:
+            # The file name (without ".pdf") becomes the candidate's name.
+            candidate_name = os.path.splitext(one_resume_pdf.name)[0]
+
+            if candidate_name in existing_candidate_names:
+                st.warning(candidate_name + " is already in the candidate "
+                          "list, skipping " + one_resume_pdf.name + ".")
+                continue
+
+            with st.spinner("Reading " + one_resume_pdf.name
+                           + " and asking the LLM for skills ..."):
+                extracted_candidate_skills = extract_skills_from_uploaded_pdf(
+                    one_resume_pdf)
+
+            if extracted_candidate_skills is None:
+                continue
+
+            if len(extracted_candidate_skills) == 0:
+                st.warning("No technical skills were found in "
+                          + one_resume_pdf.name + ".")
+                continue
+
+            st.session_state.candidates.append({
+                "name": candidate_name,
+                "skills": extracted_candidate_skills,
+            })
+            existing_candidate_names.add(candidate_name)
+            added_candidate_names.append(candidate_name)
+
+        if len(added_candidate_names) > 0:
+            st.success("Added candidate(s): " + ", ".join(added_candidate_names))
+            st.rerun()
+
+with type_candidate_tab:
+    with st.form("candidate_form", clear_on_submit=True):
+        typed_candidate_name = st.text_input("Candidate name",
+                                           placeholder="for example: John")
+        typed_candidate_skills = st.text_area(
+            "Candidate skills (one skill per line)",
+            placeholder="Python\nFlask\nDocker\nAzure",
+            height=140,
+        )
+        candidate_was_added = st.form_submit_button("Add candidate")
+
+    if candidate_was_added and typed_candidate_name.strip() != "":
+        # Turn the text area into a clean list of skills, one per line.
+        candidate_skill_list = []
+        for one_line in typed_candidate_skills.split("\n"):
+            if one_line.strip() != "":
+                candidate_skill_list.append(one_line.strip())
+
+        st.session_state.candidates.append({
+            "name": typed_candidate_name.strip(),
+            "skills": candidate_skill_list,
+        })
 
 if len(st.session_state.candidates) == 0:
     st.info("No candidates yet. Add a name and a list of skills.")
@@ -233,9 +349,11 @@ else:
 st.header("4. Score Candidates")
 st.write(
     "For every job description skill we look for the closest candidate skill "
-    "using Dijkstra's algorithm. The graph is weighted, so what we compare is "
-    "the COST of the route, not the number of steps. Staying among specific "
-    "skills is cheap. Climbing up into a generic ESCO group is expensive."
+    "using Dijkstra's algorithm. The graph only contains real ESCO "
+    "relationships - skill hierarchy links and ESCO's own curated "
+    "skill-to-skill links - never a shared classification category. If ESCO "
+    "never actually related two skills, we say so honestly instead of "
+    "guessing."
 )
 
 
@@ -363,8 +481,11 @@ def show_path_inspector(match_rows):
     st.write("**Path inspector**")
     st.caption("Pick a job description skill to see every step of the route, "
               "what kind of ESCO relationship each step used, and what it cost. "
-              "A 'skill' step is a real ESCO skill relationship and is cheap. "
-              "A 'skill_group' step is only an education category and is dear.")
+              "A 'skill' step is a real ESCO hierarchy relationship. A "
+              "'skill_relation' step is ESCO's own curated skill-to-skill "
+              "link. Both are real ESCO relationships, so both are cheap - "
+              "we only ever score real relationships, never a shared "
+              "classification category.")
 
     # Only the rows we could actually judge have a route to inspect.
     rows_to_inspect = []
@@ -427,9 +548,11 @@ def show_one_candidate_result(one_candidate, match_rows, average_similarity):
     st.write(
         "**Lines** - each one is labelled with the kind of ESCO relationship "
         "it uses and what that step costs. A thick green line marked "
-        "`skill` is a real ESCO skill relationship and is cheap. A thin "
-        "dashed grey line marked `group` is only an ESCO education category "
-        "and is expensive. Hover over a line for the full explanation."
+        "`skill` is a real ESCO hierarchy relationship. A thick blue line "
+        "marked `related` is ESCO's own curated skill-to-skill link. Both "
+        "are real, cheap ESCO relationships - we never score a route that "
+        "only shares a generic classification category. Hover over a line "
+        "for the full explanation."
     )
     components.html(build_explanation_graph_html(technology_graph, match_rows,
                                                 one_candidate["name"]),

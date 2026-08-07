@@ -11,6 +11,12 @@ That table is what makes the graph "semantic" instead of "count the hops".
 
 import os
 
+from dotenv import load_dotenv
+
+# Reads the .env file in this folder (if any) into the process environment,
+# so OPENAI_API_KEY below does not have to be set by hand every time.
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # Where the ESCO files are
 # ---------------------------------------------------------------------------
@@ -24,6 +30,7 @@ ESCO_VERSION = "1.2.1"
 SKILLS_FILE = os.path.join(DATA_FOLDER, "skills_en.csv")
 BROADER_RELATIONS_FILE = os.path.join(DATA_FOLDER, "broaderRelationsSkillPillar_en.csv")
 DIGITAL_SKILLS_FILE = os.path.join(DATA_FOLDER, "digitalSkillsCollection_en.csv")
+SKILL_SKILL_RELATIONS_FILE = os.path.join(DATA_FOLDER, "skillSkillRelations_en.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +98,20 @@ ESCO_BROADER_TYPE_GROUP = "SkillGroup"
 
 
 # ---------------------------------------------------------------------------
+# A THIRD KIND OF RELATIONSHIP: ESCO's own skill-to-skill links
+# ---------------------------------------------------------------------------
+#
+# skillSkillRelations_en.csv is not about parent and child at all. Each row is
+# ESCO directly saying two skills belong together - one is "essential" or
+# "optional" for the other - even when they sit in completely different
+# branches of the classification tree. broaderRelationsSkillPillar_en.csv can
+# only ever connect two skills that share an ancestor; this file connects
+# skills ESCO itself has curated as related, regardless of where either one
+# is filed.
+RELATION_TYPE_SKILL_RELATION = "skill_relation"  # skill <-> skill (ESCO curated link, not hierarchy)
+
+
+# ---------------------------------------------------------------------------
 # THE EDGE WEIGHTS - the heart of this graph
 # ---------------------------------------------------------------------------
 #
@@ -128,6 +149,13 @@ SKILL_GROUP_EDGE_WEIGHT_BY_DEPTH = {
 
 # Used for any group deeper than the table above.
 DEFAULT_SKILL_GROUP_EDGE_WEIGHT = 5
+
+# A skill <-> skill edge from skillSkillRelations_en.csv. This is real,
+# curated evidence that two skills go together, so both weights stay far
+# cheaper than any skill_group edge. "essential" is stronger evidence than
+# "optional", so it costs less.
+ESSENTIAL_SKILL_RELATION_WEIGHT = 1
+OPTIONAL_SKILL_RELATION_WEIGHT = 2
 
 # ---------------------------------------------------------------------------
 # Spelling repair when a typed skill does not match an ESCO name exactly
@@ -170,6 +198,25 @@ SIMILARITY_BANDS = [
 
 # Anything more expensive than the last band above.
 SIMILARITY_WHEN_TOO_FAR = 0
+
+
+# ---------------------------------------------------------------------------
+# LLM-based skill extraction from uploaded JD / resume PDFs
+# ---------------------------------------------------------------------------
+#
+# This is the one part of the project that is NOT purely ESCO-driven: an LLM
+# decides which words in a PDF are worth treating as skills at all. Whatever
+# it returns is then still mapped onto ESCO exactly like a manually typed
+# skill, so a skill the LLM invents but ESCO does not recognise still ends up
+# "not found in ESCO", same as today.
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+LLM_MODEL = "gpt-4o-mini"
+
+# Roughly a page and a half. Keeps requests cheap and fast; a JD or one
+# candidate's resume does not need more than this to list its skills.
+LLM_MAX_INPUT_CHARS = 4000
 
 
 # ---------------------------------------------------------------------------

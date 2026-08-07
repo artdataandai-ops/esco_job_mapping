@@ -1,0 +1,10 @@
+streamlit
+pandas
+networkx
+
+# PDF text extraction (JD / resume uploads)
+pymupdf
+
+# LLM-based skill extraction from uploaded documents
+openai
+python-dotenv
