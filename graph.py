@@ -12,8 +12,10 @@ MEANING you lose by taking that step.
 
   * Stepping between two very specific concepts is cheap.
         Docker  ->  Jenkins                        cost 1
-  * Climbing up to a very generic concept is expensive.
-        software development  ->  ICT              cost 8
+  * Climbing up to a very generic concept is expensive - currently a flat
+    cost for every such step, regardless of how generic the concept is.
+        computer programming  ->  software and applications
+        development and analysis                  cost 8
 
 Dijkstra always picks the cheapest route, so it naturally prefers to stay
 among specific technical concepts instead of taking a shortcut through a huge
@@ -25,6 +27,8 @@ Run this file on its own to check the graph was built correctly:
 
     python graph.py
 """
+
+import math
 
 import networkx as nx
 import pandas as pd
@@ -268,8 +272,19 @@ def add_connecting_group_uris(technology_skill_uris, parents_of, children_of):
 
 
 # ---------------------------------------------------------------------------
-# Step 3: depth, which is how we measure "how generic is this concept"
+# Step 3: two different ways to describe a node's position in the tree
 # ---------------------------------------------------------------------------
+#
+# depth is display only - it says how many steps a node sits below the
+# nearest root, and is printed in the report so a reader can see where a
+# concept sits. It no longer decides any edge's cost.
+#
+# subtree_size is what get_edge_weight() actually uses to price a
+# SKILL_GROUP edge: the number of technology concepts that sit at or below a
+# node. Two nodes can share a depth while covering wildly different numbers
+# of concepts (a whole ISCED-F branch vs. a small group of three skills), so
+# depth alone cannot tell you how generic a group really is - subtree_size
+# is the literal count, not a proxy for it.
 
 def calculate_node_depths(graph):
     """
@@ -305,6 +320,62 @@ def calculate_node_depths(graph):
     return depth_of_node
 
 
+def calculate_subtree_sizes(children_of, graph):
+    """
+    Count how many technology concepts sit at or below every node.
+
+    This is a direct measurement of how generic a concept is: a node whose
+    subtree holds only itself is as specific as it gets, and a node whose
+    subtree holds most of the graph is generic and tells you almost nothing.
+    get_edge_weight() prices a SKILL_GROUP edge from this number, because it
+    is the literal thing "how much does this group cover" - not a proxy for
+    it the way depth is.
+
+    A concept can have more than one parent in ESCO (PostgreSQL sits under
+    two different groups), so this keeps a SET of descendant URIs per node
+    and unions the children's sets together - a plain sum would double-count
+    any concept reachable through two branches.
+
+    What it does : measures how much of the technology graph each node covers.
+    Inputs       : children_of - {parent_uri: [child_uri, ...]} from
+                                 build_children_lookup(), built from the FULL,
+                                 unfiltered ESCO relations table
+                   graph        - the technology graph (already has all its
+                                 nodes), used to keep the count inside our
+                                 technology subset
+    Outputs      : a dictionary {uri: subtree_size as a whole number, >= 1}
+    """
+    descendants_of = {}
+    nodes_being_visited = set()
+
+    def collect_descendants(node_uri):
+        if node_uri in descendants_of:
+            return descendants_of[node_uri]
+
+        # A cycle would make this recurse forever. None exist in ESCO today,
+        # but this keeps one bad row from being able to crash the build.
+        if node_uri in nodes_being_visited:
+            return frozenset()
+
+        nodes_being_visited.add(node_uri)
+
+        # A node's own subtree always includes itself, so this is never empty
+        # and the smallest possible subtree_size is 1 - never 0.
+        concepts_below = {node_uri}
+        for child_uri in children_of.get(node_uri, []):
+            if child_uri != node_uri and child_uri in graph:
+                concepts_below |= collect_descendants(child_uri)
+
+        nodes_being_visited.discard(node_uri)
+        descendants_of[node_uri] = frozenset(concepts_below)
+        return descendants_of[node_uri]
+
+    for node_uri in graph.nodes:
+        collect_descendants(node_uri)
+
+    return {node_uri: len(descendants_of[node_uri]) for node_uri in graph.nodes}
+
+
 def translate_relation_type(esco_broader_type):
     """
     Translate ESCO's "broaderType" column into our own two names.
@@ -321,20 +392,24 @@ def translate_relation_type(esco_broader_type):
     return config.RELATION_TYPE_SKILL
 
 
-def get_edge_weight(relation_type, parent_uri, depth_of_node):
+def get_edge_weight(relation_type):
     """
     Decide what one edge should cost.
 
-    Two things decide it, and the relationship type matters most:
+    Kept deliberately simple for now:
 
       a SKILL edge          ->  cost 1
           "Python is a kind of computer programming"
           A real statement about the two skills, so it is cheap to walk.
 
-      a SKILL_GROUP edge    ->  cost 5, 8 or 12 depending on the group's depth
+      a SKILL_GROUP edge    ->  cost config.SKILL_GROUP_EDGE_WEIGHT
           "Python is filed under software and applications development"
-          Only a filing decision. That group holds 161 unrelated concepts, so
-          walking through it should be expensive.
+          Only a filing decision, so it should always cost more than a real
+          relationship. Every SKILL_GROUP edge currently costs the same flat
+          number, regardless of how big the group is. A size-aware version
+          (using calculate_subtree_sizes(), already computed and stored on
+          every node) was tried and can be revisited later - this is just not
+          doing that yet.
 
     Because group edges are dear, Dijkstra will automatically prefer a route
     made of real skill relationships whenever one exists, and only climb into
@@ -344,22 +419,12 @@ def get_edge_weight(relation_type, parent_uri, depth_of_node):
 
     What it does : looks up the cost of one edge.
     Inputs       : relation_type - "skill" or "skill_group"
-                   parent_uri    - the more generic end of the edge
-                   depth_of_node - from calculate_node_depths()
     Outputs      : the weight as a whole number
     """
-    # A genuine skill relationship always costs the same small amount.
     if relation_type == config.RELATION_TYPE_SKILL:
         return config.SKILL_EDGE_WEIGHT
 
-    # An education category costs more, and more still near the top of the tree.
-    depth_of_parent = depth_of_node.get(parent_uri)
-
-    if depth_of_parent is None:
-        return config.DEFAULT_SKILL_GROUP_EDGE_WEIGHT
-
-    return config.SKILL_GROUP_EDGE_WEIGHT_BY_DEPTH.get(
-        depth_of_parent, config.DEFAULT_SKILL_GROUP_EDGE_WEIGHT)
+    return config.SKILL_GROUP_EDGE_WEIGHT
 
 
 def add_skill_relation_edges(technology_graph):
@@ -428,7 +493,8 @@ def build_technology_graph():
     What it does : reads the ESCO files and produces the finished graph.
     Inputs       : nothing
     Outputs      : a NetworkX Graph where
-                     every node has  label, alternative_labels, description, depth
+                     every node has  label, alternative_labels, description,
+                                     depth, subtree_size
                      every edge has  weight, relation_type, parent_uri
     """
     skills_table = load_skills_table()
@@ -452,14 +518,22 @@ def build_technology_graph():
         relations_table["broaderLabel"],
         relations_table["broaderType"],
     ):
-        # A SkillGroup row is only a filing decision (which ISCED-F education
-        # category a skill sits under), not a statement that two skills are
-        # related. We only want real relationships in the graph, so these
-        # rows are skipped entirely - no node, no edge.
-        if esco_broader_type == config.ESCO_BROADER_TYPE_GROUP:
+        # A concept should never be its own parent. This should not happen in
+        # real ESCO data, but it costs nothing to guard against it.
+        if child_uri == parent_uri:
             continue
 
         # An edge is only created when BOTH ends are in our technology subset.
+        # This includes SkillGroup rows: a SkillGroup edge is only a filing
+        # decision (which ISCED-F education category a skill sits under), not
+        # a statement that two skills are related - but it is still a real,
+        # traversable step, just an expensive one. get_edge_weight() prices it
+        # from how many technology concepts the parent group actually covers,
+        # so Dijkstra only climbs into one when no real skill relationship
+        # exists. Dropping these rows entirely (as earlier code here did)
+        # left the graph in hundreds of disconnected pieces, since group
+        # edges are what stitches separate branches of the technology tree
+        # together.
         if child_uri in all_graph_uris and parent_uri in all_graph_uris:
             technology_graph.add_node(child_uri, label=child_label)
             technology_graph.add_node(parent_uri, label=parent_label)
@@ -485,18 +559,22 @@ def build_technology_graph():
         if skill_uri not in technology_graph:
             technology_graph.add_node(skill_uri, label=label_of_skill_uri[skill_uri])
 
-    # --- now that the shape is known, measure depth and set the weights ---
-    # This has to happen after the edges exist, because depth is worked out by
-    # walking the finished tree.
+    # --- now that the shape is known, measure depth/subtree size and set the
+    # weights --------------------------------------------------------------
+    # This has to happen after the edges exist, because both are worked out by
+    # walking the finished tree. depth is display only; subtree_size is what
+    # get_edge_weight() actually prices a SKILL_GROUP edge from.
     depth_of_node = calculate_node_depths(technology_graph)
+    subtree_size_of_node = calculate_subtree_sizes(children_of, technology_graph)
 
     for node_uri in technology_graph.nodes:
         technology_graph.nodes[node_uri]["depth"] = depth_of_node.get(node_uri, -1)
+        technology_graph.nodes[node_uri]["subtree_size"] = (
+            subtree_size_of_node.get(node_uri, 1))
 
     for first_uri, second_uri in technology_graph.edges:
         edge = technology_graph[first_uri][second_uri]
-        edge["weight"] = get_edge_weight(edge["relation_type"],
-                                        edge["parent_uri"], depth_of_node)
+        edge["weight"] = get_edge_weight(edge["relation_type"])
 
     # --- add ESCO's own curated skill-to-skill links ----------------------
     # This happens after depth is measured, so these lateral edges never get
@@ -593,8 +671,10 @@ def find_shortest_path(technology_graph, start_uri, end_uri):
     except nx.NetworkXNoPath:
         return None, None
 
-    # Dijkstra returns a float such as 4.0, so make it a whole number.
-    return path_of_uris, int(total_cost)
+    # Weights are not always whole numbers any more (a SKILL_GROUP edge might
+    # cost 9.94), so round instead of truncating - int() would silently
+    # collapse two genuinely different routes onto the same integer.
+    return path_of_uris, round(total_cost, 2)
 
 
 def get_label(technology_graph, concept_uri):
@@ -648,10 +728,27 @@ def print_graph_report(technology_graph):
         key = (edge_data["relation_type"], edge_data["weight"])
         counts[key] = counts.get(key, 0) + 1
     for relation_type, one_weight in sorted(counts):
-        print("   " + relation_type.ljust(12) + " cost " + str(one_weight).rjust(2)
+        print("   " + relation_type.ljust(14) + " cost " + str(one_weight).rjust(6)
               + "  ->  " + str(counts[(relation_type, one_weight)]) + " edges")
 
     uri_of_label = build_label_lookup(technology_graph)
+
+    print()
+    print("Biggest classification buckets (by how much of the graph they cover)")
+    print("   Every skill_group edge currently costs a flat "
+          + str(config.SKILL_GROUP_EDGE_WEIGHT)
+          + " (config.SKILL_GROUP_EDGE_WEIGHT), regardless of size - the"
+          " sizes below are shown for reference only, for later.")
+    total_technology_concepts = technology_graph.number_of_nodes()
+    subtree_size_of_node = {node_uri: technology_graph.nodes[node_uri]["subtree_size"]
+                           for node_uri in technology_graph.nodes}
+    buckets_by_size = sorted(group_nodes,
+                            key=lambda node_uri: subtree_size_of_node[node_uri],
+                            reverse=True)
+    for bucket_uri in buckets_by_size[:8]:
+        bucket_size = subtree_size_of_node[bucket_uri]
+        print("   " + technology_graph.nodes[bucket_uri]["label"]
+              + "  -  " + str(bucket_size) + " of " + str(total_technology_concepts))
 
     print()
     print("Sample nodes")
@@ -661,9 +758,12 @@ def print_graph_report(technology_graph):
             continue
         node = technology_graph.nodes[uri_of_label[label]]
         print("   " + node["label"])
-        print("      uri   :", uri_of_label[label])
-        print("      depth :", node["depth"], " (bigger means more specific)")
-        print("      alt   :", node["alternative_labels"][:3])
+        print("      uri          :", uri_of_label[label])
+        print("      depth        :", node["depth"],
+              " (bigger means more specific; display only, not used for weighting)")
+        print("      subtree_size :", node["subtree_size"],
+              " (technology concepts at or below it; not used for weighting yet)")
+        print("      alt          :", node["alternative_labels"][:3])
 
     print()
     print("Sample edges (child -> parent, and what that one step costs)")
@@ -705,7 +805,7 @@ def print_graph_report(technology_graph):
 
         route = "  ->  ".join(get_label(technology_graph, one_uri)
                              for one_uri in path_of_uris)
-        print("   cost " + str(total_cost).rjust(2) + "   " + route)
+        print("   cost " + str(total_cost).rjust(6) + "   " + route)
 
 
 if __name__ == "__main__":

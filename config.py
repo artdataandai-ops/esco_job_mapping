@@ -5,8 +5,8 @@ config.py
 Every value you might want to change lives in this one file.
 Nothing here is code you have to understand - they are just settings.
 
-The most important setting is EDGE_WEIGHT_BY_PARENT_DEPTH at the bottom.
-That table is what makes the graph "semantic" instead of "count the hops".
+The most important settings are SKILL_GROUP_EDGE_WEIGHT and SIMILARITY_DECAY_K
+below. Those are what make the graph "semantic" instead of "count the hops".
 """
 
 import os
@@ -139,16 +139,16 @@ RELATION_TYPE_SKILL_RELATION = "skill_relation"  # skill <-> skill (ESCO curated
 SKILL_EDGE_WEIGHT = 1
 
 # A skill -> ISCED group edge. Still needed to keep the graph connected, but
-# deliberately expensive. The deeper the group, the narrower it is, so the
-# cheaper the step.
-SKILL_GROUP_EDGE_WEIGHT_BY_DEPTH = {
-    0: 12,  # the very top of the classification tree - almost meaningless
-    1: 8,   # a huge ESCO group
-    2: 5,   # a mid sized ESCO group, e.g. software and applications development
-}
-
-# Used for any group deeper than the table above.
-DEFAULT_SKILL_GROUP_EDGE_WEIGHT = 5
+# deliberately expensive - a filing decision should always cost more than a
+# real relationship.
+#
+# Kept deliberately simple for now: every SKILL_GROUP edge costs this same
+# flat number, no matter how big or small the classification bucket is.
+# graph.calculate_subtree_sizes() already measures each bucket's size (it
+# still gets stored on every node and shown in the report), so a size-aware
+# cost can be wired back into get_edge_weight() later without recomputing
+# anything - this is just not doing that yet.
+SKILL_GROUP_EDGE_WEIGHT = 8
 
 # A skill <-> skill edge from skillSkillRelations_en.csv. This is real,
 # curated evidence that two skills go together, so both weights stay far
@@ -176,27 +176,20 @@ FUZZY_MATCH_CUTOFF = 0.85
 # ---------------------------------------------------------------------------
 #
 # A path cost is not a count of steps. Because a skill edge costs 1 and a
-# group edge costs 5 or more, the cost tells you what KIND of route was taken.
-# So we group the costs into bands, and each band has a real meaning:
+# group edge costs several times that, the cost tells you what KIND of route
+# was taken. Instead of sorting costs into hand-picked bands, similarity
+# decays smoothly as cost grows:
 #
-#   cost 1 or 2   the route used only genuine skill relationships
-#   cost 5+       the route had to go through an education category, which
-#                 means ESCO knows of no real relationship between the two
+#   similarity = 100 * exp(-path_cost / SIMILARITY_DECAY_K)
 #
-# Read the list from the top down and use the first band that fits:
-#   (highest cost still inside this band, similarity percentage)
+# K=10 means every 10 points of accumulated cost divides similarity by e
+# (about 2.72). It is anchored on one plain-English judgement: a direct
+# skill parent/child (cost 1) should score about 90% - solving
+# 90 = 100*exp(-1/K) for K gives about 9.5, rounded to the cleaner 10. Every
+# other point on the curve follows from that one anchor, not a separate guess.
+SIMILARITY_DECAY_K = 10.0
 
-SIMILARITY_BANDS = [
-    (0, 100),   # the very same ESCO concept
-    (1, 90),    # direct skill parent and child, e.g. git and Ansible
-    (2, 75),    # siblings under a real skill, e.g. Python and Java
-    (4, 60),    # a short chain of real skill relationships
-    (6, 50),    # one education category step, plus real skill steps
-    (10, 35),   # joined ONLY through an education category
-    (20, 15),   # joined only near the top of the classification tree
-]
-
-# Anything more expensive than the last band above.
+# Anything with no path at all in the graph - the two skills are unrelated.
 SIMILARITY_WHEN_TOO_FAR = 0
 
 

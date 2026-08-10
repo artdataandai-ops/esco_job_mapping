@@ -18,6 +18,7 @@ distance between two ESCO skills.
 """
 
 import difflib
+import math
 
 import config
 from graph import find_shortest_path, get_label
@@ -31,29 +32,25 @@ from graph import find_shortest_path, get_label
 # number of hops. A cost of 4 might be one expensive climb into a generic
 # ESCO group, or four cheap steps between very specific skills.
 #
-# Because of that we group the costs into bands instead of giving every
-# single number its own percentage. The bands live in config.SIMILARITY_BANDS.
+# Similarity decays smoothly as cost grows, instead of being sorted into
+# hand-picked bands - see config.SIMILARITY_DECAY_K for the formula and how
+# its one constant is anchored.
 
 def similarity_from_distance(path_cost):
     """
     Turn a Dijkstra path cost into a similarity percentage.
 
-    What it does : finds the first band in config.SIMILARITY_BANDS that the
-                   cost fits into, and returns that band's percentage.
-    Inputs       : path_cost - a whole number, or None when there is no path
+    What it does : applies the exponential decay curve from config.py.
+    Inputs       : path_cost - a number (not always a whole number, since a
+                   SKILL_GROUP edge can cost e.g. 9.94), or None when there
+                   is no path at all
     Outputs      : a whole number between 0 and 100
     """
     # No path at all in the graph means the two skills are unrelated.
     if path_cost is None:
         return config.SIMILARITY_WHEN_TOO_FAR
 
-    # Walk the bands from cheapest to most expensive and take the first fit.
-    for highest_cost_in_band, similarity in config.SIMILARITY_BANDS:
-        if path_cost <= highest_cost_in_band:
-            return similarity
-
-    # More expensive than every band, so the skills are too far apart.
-    return config.SIMILARITY_WHEN_TOO_FAR
+    return round(100 * math.exp(-path_cost / config.SIMILARITY_DECAY_K))
 
 
 def compare_names(first_name, second_name):
